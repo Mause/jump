@@ -1,14 +1,35 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+use libc::{pid_t, waitpid};
+
+pub struct WaitHandle {
+    pid: pid_t,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Debug)]
+pub struct WaitError {}
+impl std::fmt::Display for WaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WaitError occurred")
+    }
+}
+impl std::error::Error for WaitError {}
+impl WaitError {
+    pub fn raw_os_error(&self) -> Option<i32> {
+        None
+    }
+}
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+impl WaitHandle {
+    pub fn open(pid: i32) -> Result<WaitHandle, WaitError> {
+        Ok(WaitHandle { pid })
+    }
+    pub fn wait(&self) -> Result<(), WaitError> {
+        let status = std::ptr::from_mut(&mut 0);
+        unsafe {
+            waitpid(self.pid, status, 0);
+        }
+        if status.is_null() {
+            return Err(WaitError {});
+        }
+        Ok(())
     }
 }
