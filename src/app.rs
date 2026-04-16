@@ -84,6 +84,9 @@ pub struct ResolveLinkRequest {
     pub input: String,
     pub root: Option<PathBuf>,
     pub markers: Option<Vec<String>>,
+    /// Override for `std::env::current_dir()`. Primarily used by tests to avoid
+    /// mutating global process state; production callers leave this as `None`.
+    pub cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,6 +99,8 @@ pub struct ResolveLinkOutput {
 pub struct JumpInput {
     pub link: String,
     pub markers: Option<Vec<String>>,
+    /// Override for `std::env::current_dir()`. Primarily used by tests.
+    pub cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -584,6 +589,7 @@ fn locate_root(
     jump_req: &JumpRequest,
     requested_root: &Option<PathBuf>,
     markers: &Option<Vec<String>>,
+    cwd: Option<&Path>,
 ) -> Result<ProjectRoot> {
     let scanner = build_scanner(markers);
     let config = JumpConfig::default();
@@ -611,19 +617,18 @@ fn locate_root(
         }
     }
 
+    let resolved_cwd: PathBuf = match cwd {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("Failed to get current directory")?,
+    };
+
     let start_path: PathBuf = match jump_req.kind {
         JumpLinkKind::Absolute => jump_req
             .path
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("/")),
-        JumpLinkKind::Github => {
-            // GitHub link but couldn't find by repo name, try cwd as last resort
-            std::env::current_dir().context("Failed to get current directory")?
-        }
-        JumpLinkKind::Relative => {
-            std::env::current_dir().context("Failed to get current directory")?
-        }
+        JumpLinkKind::Github | JumpLinkKind::Relative => resolved_cwd,
     };
 
     if let Some(found) = scanner.find_root_from(&start_path)? {
@@ -652,7 +657,12 @@ pub fn resolve_link(request: ResolveLinkRequest) -> Result<ResolveLinkOutput> {
         .parse(&request.input)
         .context("Failed to parse link text")?;
 
-    let root = locate_root(&jump_req, &request.root, &request.markers)?;
+    let root = locate_root(
+        &jump_req,
+        &request.root,
+        &request.markers,
+        request.cwd.as_deref(),
+    )?;
 
     let materializer = FilesystemMaterializer;
     let materialized = materializer.materialize(&root, &jump_req)?;
@@ -819,7 +829,7 @@ pub async fn jump(input: JumpInput) -> Result<JumpOutcome> {
         .parse(&input.link)
         .context("Failed to parse link text")?;
 
-    let root = locate_root(&jump_req, &None, &input.markers)?;
+    let root = locate_root(&jump_req, &None, &input.markers, input.cwd.as_deref())?;
 
     let materializer = FilesystemMaterializer;
     let target = materializer.materialize(&root, &jump_req)?;
@@ -873,17 +883,13 @@ mod tests {
         let file = project_dir.join("src/lib.rs");
         fs::write(&file, "// test").unwrap();
 
-        let prev_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&project_dir).unwrap();
-
         let output = resolve_link(ResolveLinkRequest {
             input: "src/lib.rs:5".to_string(),
             root: None,
             markers: None,
+            cwd: Some(project_dir.clone()),
         })
         .expect("link should resolve");
-
-        std::env::set_current_dir(prev_dir).unwrap();
 
         assert_eq!(output.root.path, project_dir.canonicalize().unwrap());
         assert_eq!(output.request.kind, JumpLinkKind::Relative);
@@ -901,6 +907,7 @@ mod tests {
             input: "https://github.com/example/repo/blob/main/src/main.rs#L10".to_string(),
             root: Some(project_dir.clone()),
             markers: None,
+            cwd: None,
         })
         .expect("link should resolve");
 

@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use lsp_types::Position;
 use serde_json::Value;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tracing::{debug, trace};
 
 pub trait LspConnection {
@@ -24,8 +24,47 @@ pub trait DefinitionProvider {
 
 pub const DEFAULT_LSP_TIMEOUT_MS: u64 = 30000;
 
+/// Reads a single LSP JSON-RPC message from the given reader.
+///
+/// Parses the `Content-Length` header, reads exactly that many bytes, and
+/// decodes them as JSON. The reader must persist across calls so that bytes
+/// prefetched by the internal buffer are not dropped between messages.
+async fn read_lsp_message<R>(reader: &mut R) -> Result<Value>
+where
+    R: tokio::io::AsyncBufRead + tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    let mut content_length: usize = 0;
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            anyhow::bail!("LSP stream closed unexpectedly");
+        }
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            break;
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = value.trim().parse()?;
+        }
+    }
+
+    let mut buffer = vec![0u8; content_length];
+    reader.read_exact(&mut buffer).await?;
+
+    Ok(serde_json::from_slice(&buffer)?)
+}
+
 pub struct LspClient {
+    // Held so the lspmux child isn't reaped while stdin/reader are still alive.
+    #[allow(dead_code)]
     child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
     next_id: i32,
     timeout: Duration,
 }
@@ -55,15 +94,34 @@ impl LspClient {
             cmd.arg("--").arg("--stdio");
         }
 
-        let child = cmd
+        let mut child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .context("Failed to spawn lspmux client")?;
 
+        let stdin = child.stdin.take().context("Failed to capture stdin")?;
+        let stdout = child.stdout.take().context("Failed to capture stdout")?;
+        let stderr = child.stderr.take().context("Failed to capture stderr")?;
+
+        // Drain stderr so the server doesn't block on a full pipe buffer.
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => trace!(target: "lspmux::stderr", "{}", line.trim_end()),
+                }
+            }
+        });
+
         Ok(Self {
             child,
+            stdin,
+            reader: BufReader::new(stdout),
             next_id: 1,
             timeout,
         })
@@ -73,41 +131,15 @@ impl LspClient {
         let body = serde_json::to_string(message)?;
         let header = format!("Content-Length: {}\r\n\r\n", body.len());
 
-        let stdin = self.child.stdin.as_mut().context("Failed to get stdin")?;
-
-        stdin.write_all(header.as_bytes()).await?;
-        stdin.write_all(body.as_bytes()).await?;
-        stdin.flush().await?;
+        self.stdin.write_all(header.as_bytes()).await?;
+        self.stdin.write_all(body.as_bytes()).await?;
+        self.stdin.flush().await?;
 
         Ok(())
     }
 
     async fn read_message(&mut self) -> Result<Value> {
-        let stdout = self.child.stdout.as_mut().context("Failed to get stdout")?;
-        let mut reader = BufReader::new(stdout);
-
-        let mut content_length = 0;
-        let mut line = String::new();
-
-        loop {
-            line.clear();
-            reader.read_line(&mut line).await?;
-            let trimmed = line.trim();
-
-            if trimmed.is_empty() {
-                break;
-            }
-
-            if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-                content_length = value.trim().parse()?;
-            }
-        }
-
-        let mut buffer = vec![0u8; content_length];
-        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut buffer).await?;
-
-        let message: Value = serde_json::from_slice(&buffer)?;
-        Ok(message)
+        read_lsp_message(&mut self.reader).await
     }
 
     async fn read_message_with_timeout(&mut self) -> Result<Value> {
@@ -214,5 +246,61 @@ impl DefinitionProvider for LspClient {
             serde_json::to_value(definition_params)?,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    fn encode(msg: &Value) -> Vec<u8> {
+        let body = serde_json::to_string(msg).unwrap();
+        let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        out.extend_from_slice(body.as_bytes());
+        out
+    }
+
+    #[tokio::test]
+    async fn reads_back_to_back_messages_from_same_reader() {
+        // Regression: a fresh BufReader per call dropped bytes prefetched past
+        // Content-Length, corrupting the next read when messages arrived together.
+        let first = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": "first"});
+        let second = serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": "second"});
+
+        let mut bytes = encode(&first);
+        bytes.extend(encode(&second));
+
+        let mut reader = BufReader::new(bytes.as_slice());
+
+        let msg1 = read_lsp_message(&mut reader).await.unwrap();
+        let msg2 = read_lsp_message(&mut reader).await.unwrap();
+
+        assert_eq!(msg1["result"], "first");
+        assert_eq!(msg2["result"], "second");
+    }
+
+    #[tokio::test]
+    async fn read_message_errors_on_closed_stream() {
+        let bytes: &[u8] = b"";
+        let mut reader = BufReader::new(bytes);
+        let err = read_lsp_message(&mut reader).await.unwrap_err();
+        assert!(err.to_string().contains("closed"));
+    }
+
+    #[tokio::test]
+    async fn reads_message_with_extra_headers() {
+        let msg = serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": null});
+        let body = serde_json::to_string(&msg).unwrap();
+        let framed = format!(
+            "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let mut reader = BufReader::new(framed.as_bytes());
+        let parsed = read_lsp_message(&mut reader).await.unwrap();
+        assert_eq!(parsed["id"], 7);
     }
 }

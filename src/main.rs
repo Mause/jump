@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
     match jump::jump(jump::JumpInput {
         link: link.clone(),
         markers: markers_opt,
+        cwd: None,
     })
     .await
     {
@@ -152,26 +153,18 @@ fn log_diagnostic_context() {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}:#{window_index}.#{pane_index}",
+            "#{pane_current_command}\t#{session_name}:#{window_index}.#{pane_index}",
         ])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            // Get pane commands to filter nvim
-            let commands = std::process::Command::new("tmux")
-                .args(["list-panes", "-a", "-F", "#{pane_current_command}"])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default();
-
-            stdout
+            String::from_utf8_lossy(&o.stdout)
                 .lines()
-                .zip(commands.lines())
-                .filter(|(_, cmd)| cmd.contains("nvim"))
-                .map(|(pane, _)| pane.to_string())
+                .filter_map(|line| {
+                    let (cmd, target) = line.split_once('\t')?;
+                    cmd.contains("nvim").then(|| target.to_string())
+                })
                 .collect()
         })
         .unwrap_or_default();

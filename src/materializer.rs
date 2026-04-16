@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::{
     parser::{JumpLinkKind, JumpRequest},
@@ -89,6 +90,48 @@ impl FilesystemMaterializer {
     }
 }
 
+impl FilesystemMaterializer {
+    fn git_show_to_tempfile(root: &ProjectRoot, revision: &str, path: &Path) -> Result<PathBuf> {
+        let repo = git2::Repository::discover(&root.path)
+            .context("Failed to discover git repository")?;
+
+        let obj = repo
+            .revparse_single(revision)
+            .with_context(|| format!("Revision '{}' not found in local git history", revision))?;
+
+        let commit = obj
+            .peel_to_commit()
+            .with_context(|| format!("Failed to peel '{}' to commit", revision))?;
+
+        let tree = commit.tree().context("Failed to get commit tree")?;
+
+        let entry = tree
+            .get_path(path)
+            .with_context(|| format!("File {:?} not found at revision '{}'", path, revision))?;
+
+        let blob = repo
+            .find_blob(entry.id())
+            .context("Failed to read blob from git object store")?;
+
+        let short_rev = revision.get(..8).unwrap_or(revision);
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+        let temp_path = std::env::temp_dir().join(format!("jump_{}_{}", short_rev, file_name));
+
+        debug!(
+            "Writing git blob for {:?}@{} to {:?}",
+            path, short_rev, temp_path
+        );
+
+        std::fs::write(&temp_path, blob.content())
+            .with_context(|| format!("Failed to write temp file {:?}", temp_path))?;
+
+        Ok(temp_path)
+    }
+}
+
 impl PathMaterializer for FilesystemMaterializer {
     fn materialize(&self, root: &ProjectRoot, req: &JumpRequest) -> Result<MaterializedPath> {
         let absolute = match req.kind {
@@ -96,9 +139,18 @@ impl PathMaterializer for FilesystemMaterializer {
                 .path
                 .canonicalize()
                 .with_context(|| format!("Failed to canonicalize {:?}", req.path)),
-            JumpLinkKind::Relative | JumpLinkKind::Github => {
-                Self::resolve_under_root(root, &req.path)
-            }
+            JumpLinkKind::Relative => Self::resolve_under_root(root, &req.path),
+            JumpLinkKind::Github => Self::resolve_under_root(root, &req.path).or_else(|_| {
+                if let Some(revision) = &req.revision {
+                    debug!(
+                        "File {:?} not found locally, trying git show at {}",
+                        req.path, revision
+                    );
+                    Self::git_show_to_tempfile(root, revision, &req.path)
+                } else {
+                    Self::resolve_under_root(root, &req.path)
+                }
+            }),
         }?;
 
         let root_path = Self::canonical_root(root);

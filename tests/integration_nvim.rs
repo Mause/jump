@@ -4,7 +4,7 @@
 //! They spawn headless neovim instances for testing RPC communication.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -26,7 +26,7 @@ struct NvimProcess {
 }
 
 impl NvimProcess {
-    fn spawn(socket_path: &PathBuf) -> Option<Self> {
+    fn spawn(socket_path: &Path) -> Option<Self> {
         if let Some(parent) = socket_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -50,7 +50,7 @@ impl NvimProcess {
             if socket_path.exists() {
                 return Some(Self {
                     child,
-                    socket: socket_path.clone(),
+                    socket: socket_path.to_path_buf(),
                 });
             }
         }
