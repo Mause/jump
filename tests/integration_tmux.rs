@@ -4,7 +4,7 @@
 //! They use an isolated tmux server (separate socket) to avoid affecting user sessions.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -56,7 +56,7 @@ impl IsolatedTmux {
             .unwrap_or(0)
     }
 
-    fn create_session(&self, name: &str, dir: &PathBuf) {
+    fn create_session(&self, name: &str, dir: &Path) {
         let dir_str = dir.to_string_lossy();
         let _ = self.run(&["new-session", "-d", "-s", name, "-c", &dir_str]);
         thread::sleep(Duration::from_millis(100));
